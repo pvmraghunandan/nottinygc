@@ -6,7 +6,6 @@
 package nottinygc
 
 import (
-	"math/bits"
 	"runtime"
 	"unsafe"
 )
@@ -14,6 +13,7 @@ import (
 /*
 #include <stddef.h>
 
+void* GC_malloc_ignore_off_page(unsigned int size);
 void* GC_malloc(unsigned int size);
 void* GC_malloc_atomic(unsigned int size);
 void* GC_malloc_explicitly_typed(unsigned int size, unsigned int gc_descr);
@@ -30,6 +30,7 @@ void mi_process_info(size_t *elapsed_msecs, size_t *user_msecs, size_t *system_m
 
 void GC_ignore_warn_proc(char* msg, unsigned int arg);
 void GC_set_warn_proc(void* p);
+void GC_set_max_heap_size(unsigned int n);
 
 void onCollectionEvent();
 */
@@ -41,6 +42,11 @@ const (
 
 const (
 	gcDsBitmap = uintptr(1)
+	// Bdwgc recommend that use GC_malloc_ignore_off_page when alloc memory more than 100KB.
+	// see more info: https://github.com/ivmai/bdwgc/blob/master/README.md
+	bigObjsz = 100 * 1024
+	// WASM vm's max memory usage in Envoy is 1GB
+	maxHeapsz = 1024 * 1024 * 1024
 )
 
 var descriptorCache = newIntMap()
@@ -63,6 +69,7 @@ func initHeap() {
 	// typed GC itself.
 	C.GC_make_descriptor(nil, 0)
 	C.GC_set_warn_proc(C.GC_ignore_warn_proc)
+	C.GC_set_max_heap_size(maxHeapsz)
 }
 
 // alloc tries to find some free space on the heap, possibly doing a garbage
@@ -72,90 +79,15 @@ func initHeap() {
 func alloc(size uintptr, layoutPtr unsafe.Pointer) unsafe.Pointer {
 	var buf unsafe.Pointer
 
-	layout := uintptr(layoutPtr)
-	// We only handle the case where the layout is embedded because it is cheap to
-	// transform into a descriptor for bdwgc. Larger layouts may need to allocate,
-	// and we would want to cache the descriptor, but we cannot use a Go cache in this
-	// function which is runtime.alloc. If we wanted to pass their information to bdwgc
-	// efficiently, we would want LLVM to generate the descriptors in its format.
-	// Because TinyGo uses a byte array for bitmap and bdwgc uses a word array, there are
-	// likely endian issues in trying to use it directly.
-	if layout&1 != 0 {
-		// Layout is stored directly in the integer value.
-		// Determine format of bitfields in the integer.
-		const layoutBits = uint64(unsafe.Sizeof(layout) * 8)
-		var sizeFieldBits uint64
-		switch layoutBits { // note: this switch should be resolved at compile time
-		case 16:
-			sizeFieldBits = 4
-		case 32:
-			sizeFieldBits = 5
-		case 64:
-			sizeFieldBits = 6
-		default:
-			panic("unknown pointer size")
-		}
-		layoutSz := (layout >> 1) & (1<<sizeFieldBits - 1)
-		layoutBm := layout >> (1 + sizeFieldBits)
-		buf = allocSmall(size, layoutSz, layoutBm)
-	} else if layoutPtr == nil {
-		// Unknown layout, assume all pointers.
-		buf = C.GC_malloc(C.uint(size))
+	if size >= bigObjsz {
+		buf = C.GC_malloc_ignore_off_page(C.uint(size))
 	} else {
-		buf = allocLarge(size, layoutPtr)
+		buf = C.GC_malloc(C.uint(size))
 	}
 	if buf == nil {
 		panic("out of memory")
 	}
 	return buf
-}
-
-func allocSmall(allocSz uintptr, layoutSz uintptr, layoutBm uintptr) unsafe.Pointer {
-	desc := gcDescr(layoutBm)
-	if desc == 0 {
-		return C.GC_malloc_atomic(C.uint(allocSz))
-	}
-
-	return allocTyped(allocSz, layoutSz, desc)
-}
-
-func allocLarge(allocSz uintptr, layoutPtr unsafe.Pointer) unsafe.Pointer {
-	layoutSz := *(*uintptr)(layoutPtr)
-	desc, ok := descriptorCache.get(uintptr(layoutPtr))
-	if !ok {
-		bm := newBitmap(layoutSz)
-		bitsPtr := unsafe.Add(layoutPtr, unsafe.Sizeof(uintptr(0)))
-		for i := uintptr(0); i < layoutSz; i++ {
-			if (*(*uint8)(unsafe.Add(bitsPtr, i/8))>>(i%8))&1 != 0 {
-				bm.set(i)
-			}
-		}
-		desc = uintptr(C.GC_make_descriptor(unsafe.Pointer(&bm.words[0]), C.uint(layoutSz)))
-		descriptorCache.put(uintptr(layoutPtr), desc)
-	}
-
-	return allocTyped(allocSz, layoutSz, desc)
-}
-
-func allocTyped(allocSz uintptr, layoutSz uintptr, desc uintptr) unsafe.Pointer {
-	itemSz := layoutSz * unsafe.Sizeof(uintptr(0))
-	if itemSz == allocSz {
-		return C.GC_malloc_explicitly_typed(C.uint(allocSz), C.uint(desc))
-	}
-	numItems := allocSz / itemSz
-	return C.GC_calloc_explicitly_typed(C.uint(numItems), C.uint(itemSz), C.uint(desc))
-}
-
-// Reimplementation of the simple bitmap case from bdwgc
-// https://github.com/ivmai/bdwgc/blob/806537be2dec4f49056cb2fe091ac7f7d78728a8/typd_mlc.c#L204
-func gcDescr(layoutBm uintptr) uintptr {
-	if layoutBm == 0 {
-		return 0 // no pointers
-	}
-
-	// reversebits processes all bits but is branchless, unlike a looping version so appears
-	// to perform a little better.
-	return uintptr(bits.Reverse32(uint32(layoutBm))) | gcDsBitmap
 }
 
 //go:linkname free runtime.free
